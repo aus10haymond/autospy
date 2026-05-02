@@ -8,10 +8,11 @@ type Backend = 'auto' | 'nvidia' | 'ollama' | 'api' | 'cerebras' | 'none'
 
 interface RunViewProps {
   onActiveJobChange?: (active: boolean) => void
+  onJobStart?: (jobId: string) => void
   externalJobId?: string | null
 }
 
-export function RunView({ onActiveJobChange, externalJobId }: RunViewProps) {
+export function RunView({ onActiveJobChange, onJobStart, externalJobId }: RunViewProps) {
   const [profiles, setProfiles]           = useState<Profile[]>([])
   const [selected, setSelected]           = useState<Set<string>>(new Set())
   const [backend, setBackend]             = useState<Backend>('auto')
@@ -66,6 +67,7 @@ export function RunView({ onActiveJobChange, externalJobId }: RunViewProps) {
       const { job_id } = await api.runs.start(req)
       setJobId(job_id)
       setRunning(true)
+      onJobStart?.(job_id)
       onActiveJobChange?.(true)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to start run')

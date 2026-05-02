@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
-import { NavLink, Routes, Route, Navigate, useNavigate } from 'react-router-dom'
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { NavLink, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom'
 import { api } from './api/client'
 import type { SetupStatus, ScheduleStatus } from './api/client'
 import { useTheme } from './hooks/useTheme'
 import { StatusDot } from './components/StatusDot'
+import { LogTerminal } from './components/LogTerminal'
 import { RunView }      from './views/RunView'
 import { ProfilesView } from './views/ProfilesView'
 import { ScheduleView } from './views/ScheduleView'
@@ -25,11 +26,13 @@ const NAV = [
 export default function App() {
   useTheme() // initialises theme class on <html> and reacts to OS changes
   const navigate                            = useNavigate()
+  const location                            = useLocation()
   const [setupStatus, setSetupStatus]       = useState<SetupStatus | null>(null)
   const [scheduleStatus, setScheduleStatus] = useState<ScheduleStatus | null>(null)
   const [lastRun, setLastRun]               = useState<string | null>(null)
   const [activeJob, setActiveJob]           = useState(false)
   const [activeJobId, setActiveJobId]       = useState<string | null>(null)
+  const [consoleCollapsed, setConsoleCollapsed] = useState(false)
   // Incremented once when the backend first responds — remounts all views so
   // they re-fetch data even if their initial load fired before uvicorn was ready.
   const [routesKey, setRoutesKey]           = useState(0)
@@ -37,6 +40,8 @@ export default function App() {
   const prevScheduledJobRef                 = useRef<string | null>(null)
   const activeJobRef                        = useRef(false)
   activeJobRef.current                      = activeJob
+
+  const isRunTab = location.pathname === '/run'
 
   // Poll setup + schedule status every 30s for status bar.
   // On startup, also retry every 2s until the backend first responds so that
@@ -78,6 +83,7 @@ export default function App() {
 
     if (jobId && jobId !== prev && !activeJobRef.current) {
       setActiveJobId(jobId)
+      setConsoleCollapsed(false)
       navigate('/run')
     }
     if (!jobId) {
@@ -89,12 +95,26 @@ export default function App() {
   useEffect(() => {
     api.history.runs()
       .then(runs => {
-        if (runs.length > 0) {
-          setLastRun(new Date(runs[0].run_at).toLocaleString())
-        }
+        if (runs.length > 0) setLastRun(new Date(runs[0].run_at).toLocaleString())
       })
       .catch(() => {})
   }, [activeJob])
+
+  // Called by RunView when a manual run starts — keeps activeJobId in sync for the drawer.
+  const handleJobStart = useCallback((jobId: string) => {
+    setActiveJobId(jobId)
+    setConsoleCollapsed(false)
+  }, [])
+
+  // Called by the persistent drawer's LogTerminal when the job finishes (user is off /run tab).
+  const handleDrawerDone = useCallback(() => {
+    setActiveJob(false)
+    api.history.runs()
+      .then(runs => {
+        if (runs.length > 0) setLastRun(new Date(runs[0].run_at).toLocaleString())
+      })
+      .catch(() => {})
+  }, [])
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-slate-950 overflow-hidden">
@@ -143,7 +163,13 @@ export default function App() {
         <main className="flex-1 overflow-y-auto p-6">
           <Routes key={routesKey}>
             <Route path="/" element={<Navigate to="/run" replace />} />
-            <Route path="/run"      element={<RunView onActiveJobChange={setActiveJob} externalJobId={activeJobId} />} />
+            <Route path="/run"      element={
+              <RunView
+                onActiveJobChange={setActiveJob}
+                onJobStart={handleJobStart}
+                externalJobId={activeJobId}
+              />
+            } />
             <Route path="/schedule" element={<ScheduleView />} />
             <Route path="/profiles" element={<ProfilesView />} />
             <Route path="/history"  element={<HistoryView />} />
@@ -152,6 +178,39 @@ export default function App() {
             <Route path="/settings" element={<SettingsView />} />
           </Routes>
         </main>
+
+        {/* Persistent console drawer — visible on all tabs except /run */}
+        {activeJobId && !isRunTab && (
+          <div className="border-t border-gray-700 bg-gray-900 flex-shrink-0">
+            <div className="flex items-center justify-between px-4 py-1.5 bg-gray-800 border-b border-gray-700">
+              <div className="flex items-center gap-2">
+                {activeJob
+                  ? <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  : <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />
+                }
+                <span className="text-xs font-medium text-gray-300">Console</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setConsoleCollapsed(c => !c)}
+                  className="text-xs text-gray-400 hover:text-gray-200"
+                >
+                  {consoleCollapsed ? '▲ Expand' : '▼ Collapse'}
+                </button>
+                <button
+                  onClick={() => setActiveJobId(null)}
+                  className="text-xs text-gray-400 hover:text-gray-200"
+                  title="Dismiss console"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            {!consoleCollapsed && (
+              <LogTerminal jobId={activeJobId} onDone={handleDrawerDone} />
+            )}
+          </div>
+        )}
 
         {/* Status bar */}
         <footer className="border-t border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-5 py-2 flex items-center gap-6 text-xs text-gray-400">

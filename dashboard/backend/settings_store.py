@@ -24,6 +24,7 @@ _DEFAULTS: dict = {
     "check_interval_hours": 24,
     "schedule_enabled": False,
     "schedule_interval_hours": 24,
+    "schedule_time": "",           # "HH:MM" local time — empty = interval-only
     "schedule_profile_ids": [],
     "max_pages_per_search": 5,
     "send_email": True,

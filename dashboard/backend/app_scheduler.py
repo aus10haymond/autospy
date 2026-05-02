@@ -1,10 +1,10 @@
 """
 In-process async scheduler for Autospy.
 
-Runs a background asyncio task that polls every 60 s and fires a full
+Runs a background asyncio task that polls every 15 s and fires a full
 search+email job when the configured interval has elapsed.  State is held in
 module-level variables (reset on process restart); persistent config
-(enabled, interval, profile_ids) lives in dashboard_settings.json.
+(enabled, interval, schedule_time, profile_ids) lives in dashboard_settings.json.
 
 Lifecycle is managed by the FastAPI lifespan handler in app.py:
     startup()  → reads persisted config, starts loop if enabled
@@ -44,6 +44,7 @@ def get_status() -> dict:
     return {
         "enabled":        _is_enabled(),
         "interval_hours": _get_interval(),
+        "schedule_time":  _get_schedule_time(),
         "profile_ids":    _get_profile_ids(),
         "next_run_at":    _next_run_at.isoformat() if _next_run_at else None,
         "last_run_at":    _last_run_at,
@@ -75,8 +76,9 @@ async def startup() -> None:
         _schedule_next()
         _spawn_task()
         log.info(
-            "Scheduler: auto-started (interval=%dh, next=%s)",
+            "Scheduler: auto-started (interval=%dh, time=%r, next=%s)",
             _get_interval(),
+            _get_schedule_time(),
             _next_run_at.isoformat() if _next_run_at else "?",
         )
     else:
@@ -95,7 +97,12 @@ async def shutdown() -> None:
     _task = None
 
 
-async def apply_settings(enabled: bool, interval_hours: int, profile_ids: list[str]) -> None:
+async def apply_settings(
+    enabled: bool,
+    interval_hours: int,
+    profile_ids: list[str],
+    schedule_time: str = "",
+) -> None:
     """
     Persist new schedule settings then restart the loop so changes take effect
     immediately without a backend restart.
@@ -106,6 +113,7 @@ async def apply_settings(enabled: bool, interval_hours: int, profile_ids: list[s
         "schedule_enabled":        enabled,
         "schedule_interval_hours": interval_hours,
         "schedule_profile_ids":    profile_ids,
+        "schedule_time":           schedule_time,
     })
 
     await shutdown()
@@ -114,13 +122,37 @@ async def apply_settings(enabled: bool, interval_hours: int, profile_ids: list[s
         _schedule_next()
         _spawn_task()
         log.info(
-            "Scheduler: (re)started — interval=%dh profiles=%s next=%s",
+            "Scheduler: (re)started — interval=%dh time=%r profiles=%s next=%s",
             interval_hours,
+            schedule_time,
             profile_ids if profile_ids else "all",
             _next_run_at.isoformat() if _next_run_at else "?",
         )
     else:
         log.info("Scheduler: disabled")
+
+
+async def run_now() -> str:
+    """
+    Fire an immediate run using the scheduled profile_ids.
+    Returns the job_id immediately; the job runs in the background.
+    Updates _last_run_at and recalculates _next_run_at when the job finishes.
+    """
+    from dashboard.backend.job_manager import create_job, RunOptions
+
+    profile_ids = _get_profile_ids()
+    options = RunOptions(
+        profile_ids=profile_ids,
+        dry_run=False,
+        no_llm=False,
+        backend=None,
+        force_email=False,
+        no_email=False,
+        debug=False,
+    )
+    job = create_job(profile_ids, options)
+    asyncio.ensure_future(_launch_and_track(job.job_id))
+    return job.job_id
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -135,6 +167,11 @@ def _get_interval() -> int:
     return int(settings_store.get("schedule_interval_hours") or 24)
 
 
+def _get_schedule_time() -> str:
+    from dashboard.backend import settings_store
+    return str(settings_store.get("schedule_time") or "")
+
+
 def _get_profile_ids() -> list[str]:
     from dashboard.backend import settings_store
     return list(settings_store.get("schedule_profile_ids") or [])
@@ -144,36 +181,77 @@ def _schedule_next() -> None:
     """
     Compute and store the next fire time.
 
-    If there is run history, schedules relative to the last run so drift does
-    not accumulate across restarts.  Missed intervals are skipped forward.
-    A minimum 5-minute delay after startup prevents an immediate fire when the
-    backend restarts mid-cycle.
+    If schedule_time is set ("HH:MM"), the next wall-clock occurrence of that
+    local time is used, stepping by interval_hours (or 1 day for 24 h).
+
+    Otherwise falls back to interval-from-last-run logic.  Missed intervals
+    are detected and fire on the next poll (~15 s) rather than waiting another
+    full cycle.  A 30-second minimum delay prevents an instant re-fire on
+    settings changes.
     """
     global _next_run_at
-    interval  = timedelta(hours=_get_interval())
-    now       = datetime.now(timezone.utc)
-    min_delay = timedelta(minutes=5)
+    now           = datetime.now(timezone.utc)
+    min_delay     = timedelta(seconds=30)
+    schedule_time = _get_schedule_time()
+    interval_h    = _get_interval()
+
+    if schedule_time:
+        _next_run_at = _next_time_of_day(schedule_time, interval_h, now, min_delay)
+        return
+
+    interval = timedelta(hours=interval_h)
 
     if _last_run_at:
         try:
-            last = datetime.fromisoformat(_last_run_at.replace("Z", "+00:00"))
+            last      = datetime.fromisoformat(_last_run_at.replace("Z", "+00:00"))
             candidate = last + interval
-            missed = False
-            while candidate <= now:          # skip any missed intervals
+            missed    = False
+            while candidate <= now:
                 candidate += interval
                 missed = True
             if missed:
-                # At least one scheduled run was skipped (e.g. computer was off).
-                # Fire soon after startup rather than waiting a full interval.
-                _next_run_at = now + min_delay
+                # Fire on the next poll rather than waiting a full interval.
+                _next_run_at = now + timedelta(seconds=5)
             else:
                 _next_run_at = max(candidate, now + min_delay)
             return
         except Exception:
             pass
 
-    # No history or parse error — just wait one full interval
+    # No history or parse error — wait one full interval from now.
     _next_run_at = now + interval
+
+
+def _next_time_of_day(
+    schedule_time: str,
+    interval_hours: int,
+    now: datetime,
+    min_delay: timedelta,
+) -> datetime:
+    """Return the next UTC datetime when the local clock shows HH:MM."""
+    try:
+        h, m = (int(x) for x in schedule_time.split(":"))
+    except Exception:
+        return now + timedelta(hours=interval_hours)
+
+    local_now = datetime.now()  # naive local time
+    candidate = local_now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    step = (
+        timedelta(days=interval_hours // 24)
+        if interval_hours % 24 == 0
+        else timedelta(hours=interval_hours)
+    )
+
+    while candidate <= local_now:
+        candidate += step
+
+    try:
+        candidate_utc = candidate.astimezone(timezone.utc)
+    except Exception:
+        candidate_utc = now + timedelta(hours=interval_hours)
+
+    return max(candidate_utc, now + min_delay)
 
 
 def _spawn_task() -> None:
@@ -182,7 +260,7 @@ def _spawn_task() -> None:
 
 
 async def _run_loop() -> None:
-    """Poll every 60 s; fire a job when next_run_at is reached."""
+    """Poll every 15 s; fire a job when next_run_at is reached."""
     global _next_run_at, _last_run_at, _last_job_id, _last_status
 
     log.info(
@@ -192,7 +270,7 @@ async def _run_loop() -> None:
 
     try:
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
 
             if not _is_enabled():
                 log.info("Scheduler: disabled — loop exiting")
@@ -210,8 +288,8 @@ async def _run_loop() -> None:
                     log.error("Scheduler: job raised an exception: %s", exc)
                     _last_status = "error"
 
-                _next_run_at = datetime.now(timezone.utc) + timedelta(hours=_get_interval())
-                log.info("Scheduler: next run at %s", _next_run_at.isoformat())
+                _schedule_next()
+                log.info("Scheduler: next run at %s", _next_run_at.isoformat() if _next_run_at else "?")
 
     except asyncio.CancelledError:
         log.info("Scheduler loop cancelled")
@@ -236,3 +314,27 @@ async def _fire_and_wait() -> tuple[str, str]:
     await launch_job(job.job_id)    # blocks until subprocess exits
     finished = get_job(job.job_id)
     return job.job_id, (finished.status if finished else "unknown")
+
+
+async def _launch_and_track(job_id: str) -> None:
+    """Launch a run-now job and update scheduler state when it finishes."""
+    global _last_run_at, _last_job_id, _last_status
+    from dashboard.backend.job_manager import launch_job, get_job
+
+    _last_job_id = job_id
+    try:
+        await launch_job(job_id)
+    except Exception as exc:
+        log.error("Scheduler: run-now job %s raised: %s", job_id, exc)
+
+    job = get_job(job_id)
+    _last_run_at = datetime.now(timezone.utc).isoformat()
+    _last_status = job.status if job else "unknown"
+    log.info("Scheduler: run-now job %s finished — %s", job_id, _last_status)
+
+    if _is_enabled():
+        _schedule_next()
+        log.info(
+            "Scheduler: next run rescheduled to %s",
+            _next_run_at.isoformat() if _next_run_at else "?",
+        )

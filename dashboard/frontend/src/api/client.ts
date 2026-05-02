@@ -89,6 +89,7 @@ export interface DocFile {
 export interface ScheduleStatus {
   enabled:        boolean
   interval_hours: number
+  schedule_time:  string
   profile_ids:    string[]
   next_run_at:    string | null
   last_run_at:    string | null
@@ -101,6 +102,7 @@ export interface ScheduleStatus {
 export interface ScheduleRequest {
   enabled:        boolean
   interval_hours: number
+  schedule_time:  string
   profile_ids:    string[]
 }
 
@@ -186,6 +188,7 @@ export const api = {
   schedule: {
     get:    ()                       => request<ScheduleStatus>('/schedule'),
     update: (req: ScheduleRequest)   => request<ScheduleStatus>('/schedule', { method: 'POST', body: JSON.stringify(req) }),
+    runNow: ()                       => request<{ job_id: string }>('/schedule/run-now', { method: 'POST' }),
   },
 
   history: {

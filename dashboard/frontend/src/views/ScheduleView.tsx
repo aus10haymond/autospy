@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { api } from '../api/client'
 import type { Profile, ScheduleStatus, ScheduleRequest } from '../api/client'
 
@@ -34,34 +34,47 @@ function StatusBadge({ status }: { status: string | null }) {
 }
 
 export function ScheduleView() {
-  const [status, setStatus]       = useState<ScheduleStatus | null>(null)
-  const [profiles, setProfiles]   = useState<Profile[]>([])
-  const [draft, setDraft]         = useState<ScheduleRequest | null>(null)
-  const [customHours, setCustom]  = useState<string>('')
-  const [saving, setSaving]       = useState(false)
-  const [saved, setSaved]         = useState(false)
-  const [error, setError]         = useState<string | null>(null)
-  const [tick, setTick]           = useState(0)   // forces countdown refresh
+  const [status, setStatus]         = useState<ScheduleStatus | null>(null)
+  const [profiles, setProfiles]     = useState<Profile[]>([])
+  const [draft, setDraft]           = useState<ScheduleRequest | null>(null)
+  const [customHours, setCustom]    = useState<string>('')
+  const [saving, setSaving]         = useState(false)
+  const [saved, setSaved]           = useState(false)
+  const [error, setError]           = useState<string | null>(null)
+  const [runningNow, setRunningNow] = useState<string | null>(null)  // job_id
+  const [runNowError, setRunNowError] = useState<string | null>(null)
+  const [tick, setTick]             = useState(0)
+  const pollRef                     = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadStatus = useCallback(() => {
     api.schedule.get()
       .then(s => {
         setStatus(s)
-        // Initialise draft from live status (only on first load)
         setDraft(prev => prev ?? {
           enabled:        s.enabled,
           interval_hours: s.interval_hours,
+          schedule_time:  s.schedule_time ?? '',
           profile_ids:    s.profile_ids,
         })
+        // Clear runningNow once the job is no longer active
+        if (runningNow && !s.running_job) {
+          setRunningNow(null)
+        }
       })
       .catch(e => setError(e instanceof Error ? e.message : 'Failed to load schedule'))
-  }, [])
+  }, [runningNow])
+
+  // Restart polling interval — faster while a run-now is in progress
+  useEffect(() => {
+    if (pollRef.current) clearInterval(pollRef.current)
+    const interval = runningNow ? 5_000 : 30_000
+    pollRef.current = setInterval(loadStatus, interval)
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [loadStatus, runningNow])
 
   useEffect(() => {
     api.profiles.list().then(setProfiles).catch(console.error)
     loadStatus()
-    const id = setInterval(loadStatus, 30_000)
-    return () => clearInterval(id)
   }, [loadStatus])
 
   // Tick the countdown every 30s
@@ -92,6 +105,7 @@ export function ScheduleView() {
       setDraft({
         enabled:        updated.enabled,
         interval_hours: updated.interval_hours,
+        schedule_time:  updated.schedule_time ?? '',
         profile_ids:    updated.profile_ids,
       })
       setSaved(true)
@@ -100,6 +114,18 @@ export function ScheduleView() {
       setError(e instanceof Error ? e.message : 'Save failed')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleRunNow = async () => {
+    setRunNowError(null)
+    try {
+      const { job_id } = await api.schedule.runNow()
+      setRunningNow(job_id)
+      loadStatus()
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Run failed'
+      setRunNowError(msg)
     }
   }
 
@@ -122,11 +148,13 @@ export function ScheduleView() {
     return <div className="text-sm text-gray-400 text-center py-16">Loading…</div>
   }
 
+  const isRunning    = !!(status?.running_job || runningNow)
   const isPreset     = INTERVAL_PRESETS.includes(draft.interval_hours)
   const allProfiles  = draft.profile_ids.length === 0
   const isDirty      = status && (
     draft.enabled        !== status.enabled        ||
     draft.interval_hours !== status.interval_hours ||
+    (draft.schedule_time ?? '') !== (status.schedule_time ?? '') ||
     JSON.stringify([...draft.profile_ids].sort()) !== JSON.stringify([...status.profile_ids].sort())
   )
 
@@ -159,7 +187,26 @@ export function ScheduleView() {
 
       {/* Live status card */}
       <section className="bg-white border border-gray-200 rounded-lg px-5 py-4 space-y-3">
-        <h2 className="text-sm font-medium text-gray-700 pb-2 border-b border-gray-100">Status</h2>
+        <div className="flex items-center justify-between pb-2 border-b border-gray-100">
+          <h2 className="text-sm font-medium text-gray-700">Status</h2>
+          <button
+            onClick={handleRunNow}
+            disabled={isRunning}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 hover:border-gray-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {isRunning
+              ? <><span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" /> Running…</>
+              : '▶ Run Now'
+            }
+          </button>
+        </div>
+
+        {runNowError && (
+          <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2 flex justify-between">
+            {runNowError}
+            <button onClick={() => setRunNowError(null)} className="ml-2 font-bold">×</button>
+          </div>
+        )}
 
         <div className="flex items-center justify-between">
           <span className="text-sm text-gray-600">Scheduler</span>
@@ -270,6 +317,29 @@ export function ScheduleView() {
               )}
             </div>
           </div>
+        </div>
+
+        {/* Scheduled time */}
+        <div>
+          <label className="block text-xs font-medium text-gray-500 mb-1">Run at (optional)</label>
+          <p className="text-xs text-gray-400 mb-2">
+            Run at a specific time of day. Leave empty to run on interval alone.
+          </p>
+          <input
+            type="time"
+            value={draft.schedule_time}
+            onChange={e => setDraftField('schedule_time', e.target.value)}
+            className="rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+          {draft.schedule_time && (
+            <button
+              type="button"
+              onClick={() => setDraftField('schedule_time', '')}
+              className="ml-2 text-xs text-gray-400 hover:text-gray-600 underline"
+            >
+              Clear
+            </button>
+          )}
         </div>
 
         {/* Profiles */}
